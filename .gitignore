@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Node
+node_modules/
+.next/
+out/
+
+# Frontend (separate repo)
+frontend/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+migrations/versions/*.pyc
+
+# Claude
+.claude/
