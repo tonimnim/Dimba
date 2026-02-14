@@ -289,7 +289,9 @@ class TestRoundRobin:
                 assert home_counts[tid] == 7
                 assert away_counts[tid] == 7
 
-    def test_dates_spaced_correctly(self, app, regional_comp):
+    def test_dates_within_matchday_weekend(self, app, regional_comp):
+        """Each match should fall on the Saturday or Sunday of its matchday weekend,
+        and have a kickoff time between 13:00 and 15:00."""
         with app.app_context():
             start = date(2026, 1, 10)
             result, error = generate_round_robin(
@@ -297,8 +299,11 @@ class TestRoundRobin:
             )
             assert error is None
             for match in result:
-                expected = start + timedelta(days=(match.matchday - 1) * 7)
-                assert match.match_date.date() == expected
+                sat = start + timedelta(days=(match.matchday - 1) * 7)
+                sun = sat + timedelta(days=1)
+                assert match.match_date.date() in (sat, sun)
+                # Kickoff between 1:00 PM and 3:00 PM
+                assert 13 <= match.match_date.hour <= 15
 
     def test_standings_initialized(self, app, regional_comp):
         with app.app_context():

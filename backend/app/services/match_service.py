@@ -1,8 +1,12 @@
+from datetime import datetime, timedelta, timezone
+
 from app.extensions import db
 from app.models.match import Match, MatchStatus, MatchStage
 from app.services.standings import recalculate_standings
 from app.services.scheduler_service import advance_bracket_winner
 from app.events import event_bus
+
+MATCH_DURATION = timedelta(minutes=90)
 
 
 def create_match(data):
@@ -32,8 +36,19 @@ def submit_result(match_id, home_score, away_score, user_id):
     if match.status != MatchStatus.SCHEDULED:
         return None, "Match result can only be submitted for scheduled matches"
 
-    # Coach ownership check
     user = db.session.get(User, user_id)
+
+    # Time gate: coaches can only submit after kick-off + 90 minutes.
+    # Admins can submit anytime (for corrections, seeding, testing).
+    is_admin = user and user.role in (UserRole.SUPER_ADMIN, UserRole.COUNTY_ADMIN)
+    if not is_admin and match.match_date:
+        now = datetime.now(timezone.utc)
+        kickoff = match.match_date.replace(tzinfo=timezone.utc) if match.match_date.tzinfo is None else match.match_date
+        earliest_submit = kickoff + MATCH_DURATION
+        if now < earliest_submit:
+            return None, f"Results cannot be submitted before the match ends (earliest: {earliest_submit.isoformat()})"
+
+    # Coach ownership check
     if user and user.role == UserRole.COACH:
         if user.team_id not in [match.home_team_id, match.away_team_id]:
             return None, "You can only submit results for your own team's matches"

@@ -1,7 +1,12 @@
 import os
 from datetime import timedelta
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def _fix_db_url(url):
+    """Ensure postgresql:// URLs use the psycopg3 driver."""
+    if url and url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
 class Config:
@@ -9,9 +14,10 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30)
 
-    # SQLite engine options for concurrent traffic
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
+        "pool_size": 10,
+        "max_overflow": 20,
     }
 
     # CORS
@@ -25,8 +31,8 @@ class DevelopmentConfig(Config):
     DEBUG = True
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "jwt-dev-secret")
-    SQLALCHEMY_DATABASE_URI = os.getenv(
-        "DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'premia.db')}"
+    SQLALCHEMY_DATABASE_URI = _fix_db_url(
+        os.getenv("DATABASE_URL", "postgresql://premia:premia@localhost:5432/premia")
     )
 
 
@@ -34,21 +40,30 @@ class TestingConfig(Config):
     TESTING = True
     SECRET_KEY = "test-secret-key"
     JWT_SECRET_KEY = "test-jwt-secret"
-    SQLALCHEMY_DATABASE_URI = "sqlite://"
-    SQLALCHEMY_ENGINE_OPTIONS = {
-        "pool_pre_ping": True,
-        "poolclass": __import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool,
-        "connect_args": {"check_same_thread": False},
-    }
+    # Fall back to in-memory SQLite if DATABASE_URL not set (local dev without Postgres)
+    SQLALCHEMY_DATABASE_URI = _fix_db_url(
+        os.getenv("DATABASE_URL", "sqlite://")
+    )
     RATELIMIT_ENABLED = False
+
+
+# SQLite needs StaticPool for in-memory DB shared across threads
+if TestingConfig.SQLALCHEMY_DATABASE_URI == "sqlite://":
+    from sqlalchemy.pool import StaticPool
+    TestingConfig.SQLALCHEMY_ENGINE_OPTIONS = {
+        "connect_args": {"check_same_thread": False},
+        "poolclass": StaticPool,
+    }
+else:
+    TestingConfig.SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}
 
 
 class ProductionConfig(Config):
     DEBUG = False
     SECRET_KEY = os.getenv("SECRET_KEY")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-    SQLALCHEMY_DATABASE_URI = os.getenv(
-        "DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'premia.db')}"
+    SQLALCHEMY_DATABASE_URI = _fix_db_url(
+        os.getenv("DATABASE_URL", "postgresql://premia:premia@db:5432/premia")
     )
 
     @staticmethod

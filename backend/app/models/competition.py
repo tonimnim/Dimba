@@ -8,6 +8,7 @@ class CompetitionType(enum.Enum):
     NATIONAL = "national"
     CUP = "cup"
     SUPER = "super"
+    COUNTY = "county"
 
 
 class CompetitionCategory(enum.Enum):
@@ -38,11 +39,13 @@ class Competition(db.Model):
     category = db.Column(db.Enum(CompetitionCategory), nullable=False)
     season_id = db.Column(db.Integer, db.ForeignKey("seasons.id"), nullable=False)
     region_id = db.Column(db.Integer, db.ForeignKey("regions.id"), nullable=True)
+    county_id = db.Column(db.Integer, db.ForeignKey("counties.id"), nullable=True)
     created_at = db.Column(
         db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     # Relationships
+    county = db.relationship("County", backref="competitions")
     teams = db.relationship(
         "Team", secondary=competition_teams, backref="competitions", lazy="dynamic"
     )

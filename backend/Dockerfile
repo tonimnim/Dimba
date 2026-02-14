@@ -8,14 +8,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-
-RUN mkdir -p /app/data && chown -R appuser:appgroup /app
+# Build version: 2026-02-14-v2
+RUN chown -R appuser:appgroup /app
 
 USER appuser
 
 ENV FLASK_APP=run.py
 ENV FLASK_ENV=production
-ENV DATABASE_URL=sqlite:////app/data/premia.db
+ENV DATABASE_URL=postgresql://premia:premia@db:5432/premia
 
 EXPOSE 5000
 

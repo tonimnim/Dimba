@@ -41,22 +41,6 @@ def create_app(config_name=None):
     ma.init_app(app)
     limiter.init_app(app)
 
-    # ── SQLite pragmas ───────────────────────────────────────────────────
-    from sqlalchemy import event, Engine
-
-    @event.listens_for(Engine, "connect")
-    def set_sqlite_pragmas(dbapi_conn, connection_record):
-        import sqlite3
-
-        if isinstance(dbapi_conn, sqlite3.Connection):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA cache_size=-20000")
-            cursor.close()
-
     # ── Error handlers ───────────────────────────────────────────────────
     @app.errorhandler(ValidationError)
     def handle_validation_error(e):

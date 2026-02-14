@@ -1,6 +1,6 @@
 import math
 import random
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 
 from app.extensions import db
 from app.models.competition import Competition, CompetitionType
@@ -9,13 +9,211 @@ from app.models.standing import Standing
 from app.services.standings import sort_standings
 
 
+# ── Kick-off Times ──────────────────────────────────────────────────────────
+# Open-field pitches with no floodlights — all games between 1 PM and 5 PM.
+# Latest kickoff 3:00 PM so a ~2-hour match finishes by 5 PM.
+
+KICKOFF_TIMES = [
+    time(13, 0),   # 1:00 PM
+    time(14, 0),   # 2:00 PM
+    time(15, 0),   # 3:00 PM
+    time(13, 30),  # 1:30 PM
+    time(14, 30),  # 2:30 PM
+]
+
+DEFAULT_KICKOFF = time(15, 0)  # 3:00 PM — used for knockout/cup placeholders
+
+
+def _with_kickoff(d, kickoff):
+    """Combine a date (or datetime) with a kick-off time to produce a datetime."""
+    if isinstance(d, datetime):
+        return d.replace(hour=kickoff.hour, minute=kickoff.minute, second=0, microsecond=0)
+    return datetime.combine(d, kickoff)
+
+
+# ── Weekend Scheduling Helper ────────────────────────────────────────────────
+
+def _snap_to_friday(d):
+    """Return *d* itself if it's a Friday, otherwise the next Friday."""
+    days_ahead = 4 - d.weekday()  # Friday = 4
+    if days_ahead < 0:
+        days_ahead += 7
+    return d + timedelta(days=days_ahead)
+
+
+def _snap_to_saturday(d):
+    """Return *d* itself if it's a Saturday, otherwise the next Saturday."""
+    days_ahead = 5 - d.weekday()  # Saturday = 5
+    if days_ahead < 0:
+        days_ahead += 7
+    return d + timedelta(days=days_ahead)
+
+
+def _weekend_schedule(start_date, num_matchdays, end_date=None):
+    """Return a list of (saturday, sunday) date pairs — one per matchday.
+
+    If *end_date* is provided the matchdays are spread evenly across all
+    available weekends in the [start_date, end_date] range.  Otherwise
+    matchdays are placed on consecutive weekends.
+    """
+    first_sat = _snap_to_saturday(start_date)
+
+    if end_date is None:
+        return [
+            (first_sat + timedelta(weeks=i), first_sat + timedelta(weeks=i, days=1))
+            for i in range(num_matchdays)
+        ]
+
+    # Enumerate every weekend Saturday in the range
+    last_sat = _snap_to_saturday(end_date)
+    # If snapping pushed past end_date, step back one week
+    if last_sat > end_date:
+        last_sat -= timedelta(weeks=1)
+
+    all_sats = []
+    sat = first_sat
+    while sat <= last_sat:
+        all_sats.append(sat)
+        sat += timedelta(weeks=1)
+
+    total_weekends = len(all_sats)
+    if total_weekends == 0:
+        # Fallback: no weekends fit — just use first_sat onwards
+        return [
+            (first_sat + timedelta(weeks=i), first_sat + timedelta(weeks=i, days=1))
+            for i in range(num_matchdays)
+        ]
+
+    if num_matchdays >= total_weekends:
+        # More matchdays than weekends — use every weekend
+        chosen = all_sats[:num_matchdays] if num_matchdays <= len(all_sats) else all_sats
+        # If still not enough, extend past end_date with consecutive weekends
+        while len(chosen) < num_matchdays:
+            chosen.append(chosen[-1] + timedelta(weeks=1))
+    else:
+        # Spread matchdays evenly across available weekends
+        chosen = []
+        for i in range(num_matchdays):
+            idx = round(i * (total_weekends - 1) / (num_matchdays - 1)) if num_matchdays > 1 else 0
+            chosen.append(all_sats[idx])
+
+    return [(sat, sat + timedelta(days=1)) for sat in chosen]
+
+
+# ── County Single Round-Robin ────────────────────────────────────────────────
+
+def generate_county_round_robin(competition_id, start_date, end_date=None):
+    """Generate a single round-robin schedule for a county competition.
+
+    Single round-robin: each pair plays ONCE (not home-and-away).
+    n teams → (n-1) matchdays, n(n-1)/2 total matches.
+    Rounds ordered so local-derby matchdays come first.
+    """
+    competition = db.session.get(Competition, competition_id)
+    if not competition:
+        return None, "Competition not found"
+
+    if competition.type != CompetitionType.COUNTY:
+        return None, "Single round-robin is only for county competitions"
+
+    teams = list(competition.teams)
+    if len(teams) < 2:
+        return None, "Competition must have at least 2 teams"
+
+    existing = Match.query.filter_by(
+        competition_id=competition_id, stage=MatchStage.LEAGUE
+    ).first()
+    if existing:
+        return None, "Fixtures already generated for this competition"
+
+    n = len(teams)
+    if n % 2 != 0:
+        teams.append(None)
+        n += 1
+
+    half = n // 2
+    rounds = []
+    rotating = list(range(1, n))
+
+    for r in range(n - 1):
+        round_pairs = []
+        round_pairs.append((0, rotating[0]))
+        for i in range(1, half):
+            round_pairs.append((rotating[i], rotating[n - 1 - i]))
+        rounds.append(round_pairs)
+        rotating = [rotating[-1]] + rotating[:-1]
+
+    # Sort rounds so that matchdays with more same-county matches come first.
+    def _county_score(round_pairs):
+        score = 0
+        for home_idx, away_idx in round_pairs:
+            home = teams[home_idx]
+            away = teams[away_idx]
+            if home is not None and away is not None and home.county_id == away.county_id:
+                score += 1
+        return score
+
+    rounds.sort(key=_county_score, reverse=True)
+
+    num_matchdays = n - 1
+    weekends = _weekend_schedule(start_date, num_matchdays, end_date)
+
+    matches = []
+    matchday = 0
+
+    for round_pairs in rounds:
+        sat, sun = weekends[matchday]
+        fri = sat - timedelta(days=1)  # County matches include Friday
+        matchday += 1
+
+        # Filter out bye pairs
+        real_pairs = [
+            (h, a) for h, a in round_pairs
+            if teams[h] is not None and teams[a] is not None
+        ]
+        # County: spread across Fri/Sat/Sun with varied kickoff times
+        county_days = [fri, sat, sun]
+        for idx, (home_idx, away_idx) in enumerate(real_pairs):
+            day = county_days[idx % len(county_days)]
+            kickoff = KICKOFF_TIMES[idx % len(KICKOFF_TIMES)]
+            match_date = _with_kickoff(day, kickoff)
+
+            match = Match(
+                competition_id=competition_id,
+                season_id=competition.season_id,
+                home_team_id=teams[home_idx].id,
+                away_team_id=teams[away_idx].id,
+                match_date=match_date,
+                stage=MatchStage.LEAGUE,
+                matchday=matchday,
+                status=MatchStatus.SCHEDULED,
+            )
+            db.session.add(match)
+            matches.append(match)
+
+    actual_teams = [t for t in teams if t is not None]
+    for team in actual_teams:
+        standing = Standing(
+            team_id=team.id,
+            competition_id=competition_id,
+            season_id=competition.season_id,
+        )
+        db.session.add(standing)
+
+    db.session.commit()
+    return matches, None
+
+
 # ── Round-Robin (Regional) ───────────────────────────────────────────────────
 
-def generate_round_robin(competition_id, start_date, interval_days=7):
+def generate_round_robin(competition_id, start_date, interval_days=7, end_date=None):
     """Generate a full home-and-away round-robin schedule for a regional competition.
 
     For n teams: (n-1) rounds × 2 passes = 2(n-1) matchdays, n/2 matches per matchday.
     8 teams → 14 matchdays, 56 matches total.
+
+    All matches are scheduled on Saturdays and Sundays.  If *end_date* is
+    provided, matchdays are distributed evenly across weekends in the range.
 
     Rounds are ordered so that matchdays with more intra-county matches come first.
     This minimises early-season travel costs — local derbies are played first,
@@ -68,23 +266,31 @@ def generate_round_robin(competition_id, start_date, interval_days=7):
 
     rounds.sort(key=_county_score, reverse=True)
 
+    num_matchdays = 2 * (n - 1)
+    weekends = _weekend_schedule(start_date, num_matchdays, end_date)
+
     matches = []
     matchday = 0
 
     # First pass: original home/away
     for round_pairs in rounds:
+        sat, sun = weekends[matchday]
         matchday += 1
-        match_date = start_date + timedelta(days=(matchday - 1) * interval_days)
-        for home_idx, away_idx in round_pairs:
-            home = teams[home_idx]
-            away = teams[away_idx]
-            if home is None or away is None:
-                continue
+
+        # Filter out bye pairs
+        real_pairs = [(h, a) for h, a in round_pairs if teams[h] is not None and teams[a] is not None]
+        # Regional: spread across Sat/Sun with varied kickoff times
+        regional_days = [sat, sun]
+        for idx, (home_idx, away_idx) in enumerate(real_pairs):
+            day = regional_days[idx % len(regional_days)]
+            kickoff = KICKOFF_TIMES[idx % len(KICKOFF_TIMES)]
+            match_date = _with_kickoff(day, kickoff)
+
             match = Match(
                 competition_id=competition_id,
                 season_id=competition.season_id,
-                home_team_id=home.id,
-                away_team_id=away.id,
+                home_team_id=teams[home_idx].id,
+                away_team_id=teams[away_idx].id,
                 match_date=match_date,
                 stage=MatchStage.LEAGUE,
                 matchday=matchday,
@@ -95,18 +301,21 @@ def generate_round_robin(competition_id, start_date, interval_days=7):
 
     # Second pass: reversed home/away (same round order so local derbies stay early)
     for round_pairs in rounds:
+        sat, sun = weekends[matchday]
         matchday += 1
-        match_date = start_date + timedelta(days=(matchday - 1) * interval_days)
-        for home_idx, away_idx in round_pairs:
-            home = teams[home_idx]
-            away = teams[away_idx]
-            if home is None or away is None:
-                continue
+
+        real_pairs = [(h, a) for h, a in round_pairs if teams[h] is not None and teams[a] is not None]
+        regional_days = [sat, sun]
+        for idx, (home_idx, away_idx) in enumerate(real_pairs):
+            day = regional_days[idx % len(regional_days)]
+            kickoff = KICKOFF_TIMES[idx % len(KICKOFF_TIMES)]
+            match_date = _with_kickoff(day, kickoff)
+
             match = Match(
                 competition_id=competition_id,
                 season_id=competition.season_id,
-                home_team_id=away.id,
-                away_team_id=home.id,
+                home_team_id=teams[away_idx].id,
+                away_team_id=teams[home_idx].id,
                 match_date=match_date,
                 stage=MatchStage.LEAGUE,
                 matchday=matchday,
@@ -126,6 +335,136 @@ def generate_round_robin(competition_id, start_date, interval_days=7):
 
     db.session.commit()
     return matches, None
+
+
+# ── Regional Group Stage ─────────────────────────────────────────────────────
+
+def generate_regional_groups(competition_id, start_date, target_group_size=8):
+    """Generate regional group stage with pot-based draw.
+
+    Groups: num_groups = max(4, ceil(total_teams / target_group_size))
+    Constraint: no two teams from the same county in any group.
+    Single round-robin within each group.
+    """
+    competition = db.session.get(Competition, competition_id)
+    if not competition:
+        return None, "Competition not found"
+
+    if competition.type != CompetitionType.REGIONAL:
+        return None, "Regional group stage is only for regional competitions"
+
+    teams = list(competition.teams)
+    if len(teams) < 2:
+        return None, "Competition must have at least 2 teams"
+
+    existing = Match.query.filter_by(
+        competition_id=competition_id, stage=MatchStage.GROUP
+    ).first()
+    if existing:
+        return None, "Group fixtures already generated for this competition"
+
+    # ── Calculate number of groups ────────────────────────────────────
+    num_groups = max(4, math.ceil(len(teams) / target_group_size))
+    group_letters = [chr(65 + i) for i in range(num_groups)]
+    groups = {letter: [] for letter in group_letters}
+
+    # ── Pot-based draw algorithm ──────────────────────────────────────
+    county_map = {}
+    for team in teams:
+        county_map.setdefault(team.county_id, []).append(team)
+
+    county_ids = list(county_map.keys())
+    random.shuffle(county_ids)
+    for cid in county_ids:
+        random.shuffle(county_map[cid])
+
+    # Snake-assign: team[j] from county[i] → group[(i + j) % num_groups]
+    for i, cid in enumerate(county_ids):
+        for j, team in enumerate(county_map[cid]):
+            group_idx = (i + j) % num_groups
+            groups[group_letters[group_idx]].append(team)
+
+    # ── Verify same-county constraint ─────────────────────────────────
+    for letter, group_teams in groups.items():
+        county_ids_in_group = [t.county_id for t in group_teams]
+        if len(set(county_ids_in_group)) != len(county_ids_in_group):
+            return None, "Group draw failed: same-county teams in one group"
+
+    # ── Single round-robin within each group (circle method) ──────────
+    max_rounds = max(
+        len(g) + (1 if len(g) % 2 else 0) - 1
+        for g in groups.values() if len(g) >= 2
+    )
+    weekends = _weekend_schedule(start_date, max_rounds)
+
+    all_matches = []
+
+    for letter in group_letters:
+        g_teams = groups[letter]
+        g = len(g_teams)
+        if g < 2:
+            continue
+
+        if g % 2 != 0:
+            g_teams.append(None)
+            g += 1
+
+        rotating = list(range(1, g))
+        for r in range(g - 1):
+            round_pairs = [(0, rotating[0])]
+            for k in range(1, g // 2):
+                round_pairs.append((rotating[k], rotating[g - 1 - k]))
+
+            sat, sun = weekends[r]
+            real_pairs = [
+                (h, a) for h, a in round_pairs
+                if g_teams[h] is not None and g_teams[a] is not None
+            ]
+
+            # Regional groups: Sat/Sun with varied kickoff times
+            group_days = [sat, sun]
+            for idx, (hi, ai) in enumerate(real_pairs):
+                day = group_days[idx % len(group_days)]
+                kickoff = KICKOFF_TIMES[idx % len(KICKOFF_TIMES)]
+                match_date = _with_kickoff(day, kickoff)
+
+                match = Match(
+                    competition_id=competition_id,
+                    season_id=competition.season_id,
+                    home_team_id=g_teams[hi].id,
+                    away_team_id=g_teams[ai].id,
+                    match_date=match_date,
+                    stage=MatchStage.GROUP,
+                    group_name=letter,
+                    matchday=r + 1,
+                    status=MatchStatus.SCHEDULED,
+                )
+                db.session.add(match)
+                all_matches.append(match)
+
+            rotating = [rotating[-1]] + rotating[:-1]
+
+    # ── Create Standing records ───────────────────────────────────────
+    for letter, g_teams in groups.items():
+        for team in g_teams:
+            if team is not None:
+                standing = Standing(
+                    team_id=team.id,
+                    competition_id=competition_id,
+                    season_id=competition.season_id,
+                    group_name=letter,
+                )
+                db.session.add(standing)
+
+    db.session.commit()
+
+    return {
+        "groups": {
+            letter: [t.id for t in gteams if t is not None]
+            for letter, gteams in groups.items()
+        },
+        "matches": all_matches,
+    }, None
 
 
 # ── Champions League Groups ──────────────────────────────────────────────────
@@ -184,7 +523,8 @@ def generate_cl_groups(competition_id, start_date, interval_days=7):
         if len(set(region_ids_in_group)) != len(region_ids_in_group):
             return None, "Group draw failed: same-region teams in one group"
 
-    matches = []
+    # Build matchday → list of (home, away, group_letter) across all groups
+    matchday_fixtures = {}
     for letter, group_teams in groups.items():
         a, b, c = group_teams
         pairings = [
@@ -192,7 +532,21 @@ def generate_cl_groups(competition_id, start_date, interval_days=7):
             (b, a, 4), (a, c, 5), (c, b, 6),
         ]
         for home, away, md in pairings:
-            match_date = start_date + timedelta(days=(md - 1) * interval_days)
+            matchday_fixtures.setdefault(md, []).append((home, away, letter))
+
+    # Schedule each matchday's 7 matches across Fri / Sat / Sun
+    matches = []
+    for md in sorted(matchday_fixtures):
+        friday = _snap_to_friday(start_date + timedelta(weeks=md - 1))
+        saturday = friday + timedelta(days=1)
+        sunday = friday + timedelta(days=2)
+        weekend_days = [friday, saturday, sunday]
+
+        fixtures = matchday_fixtures[md]
+        for idx, (home, away, letter) in enumerate(fixtures):
+            day = weekend_days[idx % 3]
+            kickoff = KICKOFF_TIMES[idx % len(KICKOFF_TIMES)]
+            match_date = _with_kickoff(day, kickoff)
             match = Match(
                 competition_id=competition_id,
                 season_id=competition.season_id,
@@ -207,6 +561,7 @@ def generate_cl_groups(competition_id, start_date, interval_days=7):
             db.session.add(match)
             matches.append(match)
 
+    for letter, group_teams in groups.items():
         for team in group_teams:
             standing = Standing(
                 team_id=team.id,
@@ -326,7 +681,9 @@ def generate_cl_knockout_bracket(competition_id, team_pairs, start_date, interva
     round_offset = 0
 
     # ── Final (bracket_position=1, single leg) ───────────────────────
-    final_date = start_date + timedelta(days=interval_days * 4)
+    final_date = _with_kickoff(
+        start_date + timedelta(days=interval_days * 4), DEFAULT_KICKOFF
+    )
     final = Match(
         competition_id=competition_id,
         season_id=season_id,
@@ -350,7 +707,9 @@ def generate_cl_knockout_bracket(competition_id, team_pairs, start_date, interva
                 season_id=season_id,
                 home_team_id=None,
                 away_team_id=None,
-                match_date=sf_date + timedelta(days=(leg - 1) * 7),
+                match_date=_with_kickoff(
+                    sf_date + timedelta(days=(leg - 1) * 7), DEFAULT_KICKOFF
+                ),
                 stage=MatchStage.SEMI_FINAL,
                 bracket_position=bp,
                 leg=leg,
@@ -373,7 +732,9 @@ def generate_cl_knockout_bracket(competition_id, team_pairs, start_date, interva
                 season_id=season_id,
                 home_team_id=home_id,
                 away_team_id=away_id,
-                match_date=start_date + timedelta(days=(leg - 1) * 7),
+                match_date=_with_kickoff(
+                    start_date + timedelta(days=(leg - 1) * 7), DEFAULT_KICKOFF
+                ),
                 stage=MatchStage.QUARTER_FINAL,
                 bracket_position=bp,
                 leg=leg,
@@ -437,7 +798,10 @@ def generate_cup_draw(competition_id, start_date, interval_days=7):
         stage = _bracket_pos_to_stage(bp, num_rounds)
         depth = int(math.log2(bp))
         round_num = num_rounds - depth
-        match_date = start_date + timedelta(days=(round_num - 1) * interval_days)
+        match_date = _with_kickoff(
+            start_date + timedelta(days=(round_num - 1) * interval_days),
+            DEFAULT_KICKOFF,
+        )
 
         m = Match(
             competition_id=competition_id,
@@ -486,7 +850,7 @@ def generate_cup_draw(competition_id, start_date, interval_days=7):
             season_id=season_id,
             home_team_id=team_a.id,
             away_team_id=team_b.id,
-            match_date=start_date,
+            match_date=_with_kickoff(start_date, KICKOFF_TIMES[match_idx % len(KICKOFF_TIMES)]),
             stage=MatchStage.ROUND_1,
             bracket_position=bp,
             round_number=1,

@@ -10,6 +10,7 @@ def create_competition(data):
         category=CompetitionCategory(data["category"]),
         season_id=data["season_id"],
         region_id=data.get("region_id"),
+        county_id=data.get("county_id"),
     )
     db.session.add(competition)
     db.session.commit()
@@ -40,6 +41,9 @@ def add_team_to_competition(comp_id, team_id):
     team = db.session.get(Team, team_id)
     if not team:
         return None, "Team not found"
+
+    if team in competition.teams.all():
+        return None, "Team is already in this competition"
 
     competition.teams.append(team)
     db.session.commit()

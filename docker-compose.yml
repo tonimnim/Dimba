@@ -1,14 +1,33 @@
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: premia
+      POSTGRES_PASSWORD: premia
+      POSTGRES_DB: premia
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U premia"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   backend:
     build: ./backend
     ports:
       - "5000:5000"
-    volumes:
-      - backend-data:/app/data
     env_file:
       - ./backend/.env
     environment:
       - FLASK_ENV=production
+      - DATABASE_URL=postgresql://premia:premia@db:5432/premia
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://*.vercel.app,https://*.ngrok-free.app
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
@@ -16,28 +35,17 @@ services:
       retries: 3
       start_period: 10s
 
-  frontend:
-    build:
-      context: ./frontend
-      args:
-        NEXT_PUBLIC_API_URL: ""
-        BACKEND_URL: "http://backend:5000"
-    ports:
-      - "3000:3000"
-    depends_on:
-      backend:
-        condition: service_healthy
-
   ngrok:
     image: ngrok/ngrok:latest
     restart: unless-stopped
-    command: http frontend:3000 --log stdout
+    command: http backend:5000 --log stdout
     ports:
       - "4040:4040"
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     depends_on:
-      - frontend
+      backend:
+        condition: service_healthy
 
 volumes:
-  backend-data:
+  db-data:

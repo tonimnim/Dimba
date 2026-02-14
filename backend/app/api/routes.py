@@ -63,6 +63,8 @@ from app.services.transfer_service import (
 )
 from app.services.scheduler_service import (
     generate_round_robin,
+    generate_county_round_robin,
+    generate_regional_groups,
     generate_cl_groups,
     advance_cl_knockout,
     generate_cl_knockout_bracket,
@@ -74,6 +76,7 @@ from app.services.qualification_service import (
     get_competition_status,
     get_top_teams,
     qualify_for_champions_league,
+    qualify_for_regional,
 )
 
 api_bp = Blueprint("api", __name__)
@@ -243,7 +246,8 @@ def add_team_to_competition_route(comp_id):
         return jsonify({"error": "team_id is required"}), 400
     competition, error = add_team_to_competition(comp_id, data["team_id"])
     if error:
-        return jsonify({"error": error}), 404
+        status = 409 if "already" in error else 404
+        return jsonify({"error": error}), status
     return jsonify({"message": "Team added to competition"}), 200
 
 
@@ -478,6 +482,8 @@ def get_matches():
     competition_id = request.args.get("competition_id", type=int)
     season_id = request.args.get("season_id", type=int)
     team_id = request.args.get("team_id", type=int)
+    region_id = request.args.get("region_id", type=int)
+    competition_type = request.args.get("competition_type")
     status = request.args.get("status")
     date_str = request.args.get("date")  # YYYY-MM-DD
     matchday = request.args.get("matchday", type=int)
@@ -485,6 +491,12 @@ def get_matches():
     group_name = request.args.get("group_name")
 
     query = Match.query
+    if region_id or competition_type:
+        query = query.join(Competition)
+        if region_id:
+            query = query.filter(Competition.region_id == region_id)
+        if competition_type:
+            query = query.filter(Competition.type == CompetitionType(competition_type))
     if competition_id:
         query = query.filter_by(competition_id=competition_id)
     if season_id:
@@ -560,11 +572,34 @@ def confirm_match_result(match_id):
 def get_standings():
     competition_id = request.args.get("competition_id", type=int)
     season_id = request.args.get("season_id", type=int)
-
+    region_id = request.args.get("region_id", type=int)
+    competition_type = request.args.get("competition_type")
     group_name = request.args.get("group_name")
 
-    if not competition_id or not season_id:
-        return jsonify({"error": "competition_id and season_id are required"}), 400
+    if not season_id:
+        return jsonify({"error": "season_id is required"}), 400
+
+    # Region-wide standings: fetch all standings for competitions in the region,
+    # sort each competition's standings independently, return flattened.
+    if region_id or competition_type:
+        query = Standing.query.join(Competition).filter(Standing.season_id == season_id)
+        if region_id:
+            query = query.filter(Competition.region_id == region_id)
+        if competition_type:
+            query = query.filter(Competition.type == CompetitionType(competition_type))
+        raw = query.all()
+
+        # Group by competition_id, sort each group
+        from itertools import groupby
+        raw.sort(key=lambda s: s.competition_id)
+        all_sorted = []
+        for comp_id, group in groupby(raw, key=lambda s: s.competition_id):
+            all_sorted.extend(sort_standings(list(group), comp_id, season_id))
+
+        return jsonify({"standings": standings_schema.dump(all_sorted)}), 200
+
+    if not competition_id:
+        return jsonify({"error": "competition_id or region_id is required"}), 400
 
     query = Standing.query.filter_by(
         competition_id=competition_id, season_id=season_id
@@ -585,13 +620,44 @@ def get_standings():
 def generate_fixtures_route(comp_id):
     data = generate_fixtures_schema.load(request.get_json())
     result, error = generate_round_robin(
-        comp_id, data["start_date"], data.get("interval_days", 7)
+        comp_id, data["start_date"], data.get("interval_days", 7), data.get("end_date")
     )
     if error:
         return jsonify({"error": error}), 409 if "already" in error.lower() else 400
     return jsonify({
         "message": "Fixtures generated",
         "match_count": len(result),
+    }), 201
+
+
+@api_bp.route("/competitions/<int:comp_id>/generate-county-fixtures", methods=["POST"])
+@admin_required
+def generate_county_fixtures_route(comp_id):
+    data = generate_fixtures_schema.load(request.get_json())
+    result, error = generate_county_round_robin(
+        comp_id, data["start_date"], data.get("end_date")
+    )
+    if error:
+        return jsonify({"error": error}), 409 if "already" in error.lower() else 400
+    return jsonify({
+        "message": "County fixtures generated",
+        "match_count": len(result),
+    }), 201
+
+
+@api_bp.route("/competitions/<int:comp_id>/generate-regional-groups", methods=["POST"])
+@admin_required
+def generate_regional_groups_route(comp_id):
+    data = generate_fixtures_schema.load(request.get_json())
+    result, error = generate_regional_groups(
+        comp_id, data["start_date"]
+    )
+    if error:
+        return jsonify({"error": error}), 409 if "already" in error.lower() else 400
+    return jsonify({
+        "message": "Regional group draw completed",
+        "groups": result["groups"],
+        "match_count": len(result["matches"]),
     }), 201
 
 
@@ -693,6 +759,61 @@ def reset_bracket_route(comp_id):
     return jsonify({"message": f"Bracket reset — {len(bracket_matches)} match(es) deleted"}), 200
 
 
+@api_bp.route("/fixtures/reset-all", methods=["DELETE"])
+@admin_required
+def reset_all_fixtures_route():
+    """[TEMP] Delete all league matches and standings across every competition."""
+    league_matches = Match.query.filter_by(stage=MatchStage.LEAGUE).all()
+    standings = Standing.query.all()
+
+    match_count = len(league_matches)
+    standing_count = len(standings)
+
+    for m in league_matches:
+        db.session.delete(m)
+    for s in standings:
+        db.session.delete(s)
+    db.session.commit()
+
+    return jsonify({
+        "message": f"Reset complete — {match_count} match(es) and {standing_count} standing(s) deleted"
+    }), 200
+
+
+@api_bp.route("/fixtures/reset-county", methods=["DELETE"])
+@admin_required
+def reset_county_fixtures_route():
+    """[TEMP] Delete ALL county league matches and standings across every county competition."""
+    county_comp_ids = [
+        c.id for c in Competition.query.filter_by(
+            type=CompetitionType.COUNTY
+        ).all()
+    ]
+    if not county_comp_ids:
+        return jsonify({"error": "No county competitions found"}), 404
+
+    league_matches = Match.query.filter(
+        Match.competition_id.in_(county_comp_ids),
+        Match.stage == MatchStage.LEAGUE,
+    ).all()
+    standings = Standing.query.filter(
+        Standing.competition_id.in_(county_comp_ids)
+    ).all()
+
+    match_count = len(league_matches)
+    standing_count = len(standings)
+
+    for m in league_matches:
+        db.session.delete(m)
+    for s in standings:
+        db.session.delete(s)
+    db.session.commit()
+
+    return jsonify({
+        "message": f"County reset — {match_count} match(es) and {standing_count} standing(s) deleted"
+    }), 200
+
+
 # ─── Qualification ────────────────────────────────────────────────────────
 
 @api_bp.route("/competitions/<int:comp_id>/status", methods=["GET"])
@@ -731,6 +852,25 @@ def qualify_for_cl_route(season_id):
 
     result, error = qualify_for_champions_league(
         season_id, data["cl_competition_id"], top_n=data.get("top_n", 3)
+    )
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 200
+
+
+@api_bp.route("/seasons/<int:season_id>/qualify-for-regional", methods=["POST"])
+@admin_required
+def qualify_for_regional_route(season_id):
+    """Qualify top teams from completed county leagues into a regional competition.
+
+    Body: { "regional_competition_id": 42, "top_n": 4 }
+    """
+    data = request.get_json()
+    if not data or "regional_competition_id" not in data:
+        return jsonify({"error": "regional_competition_id is required"}), 400
+
+    result, error = qualify_for_regional(
+        season_id, data["regional_competition_id"], top_n=data.get("top_n", 4)
     )
     if error:
         return jsonify({"error": error}), 400
