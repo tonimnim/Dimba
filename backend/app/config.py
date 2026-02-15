@@ -40,22 +40,11 @@ class TestingConfig(Config):
     TESTING = True
     SECRET_KEY = "test-secret-key"
     JWT_SECRET_KEY = "test-jwt-secret"
-    # Fall back to in-memory SQLite if DATABASE_URL not set (local dev without Postgres)
     SQLALCHEMY_DATABASE_URI = _fix_db_url(
-        os.getenv("DATABASE_URL", "sqlite://")
+        os.getenv("DATABASE_URL", "postgresql://premia:premia@localhost:5432/premia_test")
     )
+    SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}
     RATELIMIT_ENABLED = False
-
-
-# SQLite needs StaticPool for in-memory DB shared across threads
-if TestingConfig.SQLALCHEMY_DATABASE_URI == "sqlite://":
-    from sqlalchemy.pool import StaticPool
-    TestingConfig.SQLALCHEMY_ENGINE_OPTIONS = {
-        "connect_args": {"check_same_thread": False},
-        "poolclass": StaticPool,
-    }
-else:
-    TestingConfig.SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}
 
 
 class ProductionConfig(Config):

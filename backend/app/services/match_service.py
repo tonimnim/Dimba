@@ -85,6 +85,30 @@ def confirm_result(match_id, user_id, penalty_winner_id=None):
             return None, "penalty_winner_id must be one of the two teams in this match"
         match.penalty_winner_id = penalty_winner_id
 
+    # For two-legged knockout: on leg 2 confirmation, check if aggregate
+    # is tied (including away goals). If so, require penalty_winner_id.
+    if is_knockout and match.leg == 2:
+        leg1 = Match.query.filter_by(
+            competition_id=match.competition_id,
+            bracket_position=match.bracket_position,
+            leg=1,
+        ).first()
+        if leg1 and leg1.status == MatchStatus.CONFIRMED:
+            team_a_id = leg1.home_team_id
+            team_a_goals = (leg1.home_score or 0) + (match.away_score or 0)
+            team_b_goals = (leg1.away_score or 0) + (match.home_score or 0)
+            if team_a_goals == team_b_goals:
+                # Tied on aggregate — check away goals
+                team_a_away = match.away_score or 0
+                team_b_away = leg1.away_score or 0
+                if team_a_away == team_b_away:
+                    # Still tied — need penalties
+                    if not penalty_winner_id:
+                        return None, "Two-legged tie drawn on aggregate and away goals — specify penalty_winner_id"
+                    if penalty_winner_id not in [match.home_team_id, match.away_team_id]:
+                        return None, "penalty_winner_id must be one of the two teams in this match"
+                    match.penalty_winner_id = penalty_winner_id
+
     match.status = MatchStatus.CONFIRMED
     match.confirmed_by_id = user_id
 

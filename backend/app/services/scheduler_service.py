@@ -954,7 +954,13 @@ def _advance_two_legged(match):
         elif team_b_away > team_a_away:
             winner_id = team_b_id
         else:
-            return  # Still tied — needs manual resolution (penalties etc.)
+            # Still tied — check for penalty winner on leg 2
+            if leg2.penalty_winner_id:
+                winner_id = leg2.penalty_winner_id
+            elif leg1.penalty_winner_id:
+                winner_id = leg1.penalty_winner_id
+            else:
+                return  # No penalty resolution available
 
     parent_bp = match.bracket_position // 2
     is_home = (match.bracket_position % 2 == 0)
